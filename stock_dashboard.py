@@ -1,17 +1,30 @@
 """
-Stock Screener Dashboard (Streamlit)
-=====================================
+Stock Screener Dashboard (Streamlit) — v2
+==========================================
 
-Web version of stock_screener.py — deploy this once (free, via Streamlit
-Community Cloud) and you get a URL you can open from Safari on your
-iPhone any time, no need to keep your own computer running.
+Changes from v1:
+  - Can screen the full S&P 500 (fetched live from Wikipedia), not just
+    a manual ticker list. Batched downloads + a ticker cap protect
+    against the page hanging or Yahoo rate-limiting you.
+  - CAGR is now shown for both 5-year and 10-year windows vs gold,
+    not a single blended lookback.
+  - Two-stage display: a FUNDAMENTAL screen (must-beat-gold filters)
+    runs on the whole universe first; the (usually much smaller) set
+    of stocks that pass then gets the full technical readout
+    (RSI / CDC ActionZone / volume) for you to eyeball and decide —
+    with the automatic combined ALERT column kept exactly as before.
+  - Volume is now checked two ways: RVOL (vs its own 20-day average)
+    AND a 1-year volume percentile (is today's volume unusually high
+    vs the last ~252 trading days, not just the last 20).
+  - New "Backtest" tab: pick one ticker, replay the same ALERT logic
+    over history, and see what happened to price N days after each
+    past signal (5 / 20 / 60 trading days forward).
+
+REQUIREMENTS:
+    pip install streamlit yfinance pandas numpy lxml
 
 LOCAL TEST:
-    pip install streamlit yfinance pandas numpy
     streamlit run stock_dashboard.py
-
-DEPLOY (so it's reachable from your iPhone) — see deployment steps
-in the chat message alongside this file.
 """
 
 import numpy as np
@@ -23,81 +36,160 @@ from datetime import datetime
 st.set_page_config(page_title="Gold-Beating Stock Screener", layout="wide")
 
 # ============================================================
-# SIDEBAR — editable thresholds (mirrors CONFIG in the CLI version)
+# CONSTANTS
 # ============================================================
 
-st.sidebar.header("⚙️ Screening Criteria")
+RETURN_FREQ = "W"
+CDC_SMOOTH, CDC_FAST, CDC_SLOW = 2, 12, 26
+RSI_PERIOD = 14
+BATCH_SIZE = 40          # tickers per yf.download call
+VOL_PCT_WINDOW = 252     # ~1 trading year
 
-tickers_input = st.sidebar.text_area(
-    "Tickers (comma-separated)",
-    value="AAPL, MSFT, NVDA, GOOGL, AMZN, META, TSM",
+
+# ============================================================
+# SIDEBAR — universe + thresholds
+# ============================================================
+
+st.sidebar.header("⚙️ Universe")
+
+universe_mode = st.sidebar.radio(
+    "Ticker source", ["Custom list", "Full S&P 500 (capped)"], index=0
 )
-TICKERS = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+
+if universe_mode == "Custom list":
+    tickers_input = st.sidebar.text_area(
+        "Tickers (comma-separated)",
+        value="AAPL, MSFT, NVDA, GOOGL, AMZN, META, TSM",
+    )
+    RAW_TICKERS = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+else:
+    MAX_TICKERS = st.sidebar.slider(
+        "Max tickers to screen (caps run time / avoids hangs)",
+        min_value=25, max_value=500, value=100, step=25,
+    )
+    st.sidebar.caption(
+        f"Screening {MAX_TICKERS} of 500 — full 500 can take several minutes "
+        "and may hit Yahoo Finance rate limits."
+    )
+    RAW_TICKERS = None  # resolved after sp500 list is fetched
 
 GOLD_PROXY = st.sidebar.text_input("Gold proxy ticker", value="GLD")
 VIX_TICKER = "^VIX"
-LOOKBACK_PERIOD = st.sidebar.selectbox(
-    "Lookback period", ["1y", "2y", "3y", "5y"], index=1
-)
 RISK_FREE_RATE = st.sidebar.number_input(
     "Risk-free rate (annualized)", value=0.05, step=0.005, format="%.3f"
 )
 
-st.sidebar.subheader("Fundamental filters")
+st.sidebar.subheader("Fundamental filters (must-beat-gold)")
+CAGR_WINDOW_FOR_FILTER = st.sidebar.selectbox(
+    "Use which CAGR window to filter eligibility", ["5y", "10y"], index=0
+)
 CORRELATION_MAX = st.sidebar.slider("Max correlation vs gold", -1.0, 1.0, 0.2, 0.05)
 SHARPE_MIN = st.sidebar.slider("Min Sharpe ratio", 0.0, 3.0, 1.0, 0.1)
-CAGR_MUST_BEAT_GOLD = st.sidebar.checkbox("Must beat gold CAGR", value=True)
 
-st.sidebar.subheader("Technical / timing filters")
-RVOL_THRESHOLD = st.sidebar.slider("Min relative volume (RVOL)", 0.5, 5.0, 1.5, 0.1)
-RSI_PERIOD = 14
+st.sidebar.subheader("Technical / timing filters (for ALERT + your own read)")
+RVOL_THRESHOLD = st.sidebar.slider("Min relative volume (RVOL, vs 20d avg)", 0.5, 5.0, 1.5, 0.1)
+VOL_PCT_THRESHOLD = st.sidebar.slider("Min volume percentile (vs past 1y)", 0.0, 1.0, 0.8, 0.05)
 RSI_BUY_THRESHOLD = st.sidebar.slider("RSI buy zone (below)", 10, 70, 40, 1)
 VIX_FEAR_THRESHOLD = st.sidebar.slider("VIX fear threshold", 10, 50, 25, 1)
 
-CDC_SMOOTH, CDC_FAST, CDC_SLOW = 2, 12, 26
-RETURN_FREQ = "W"
-
 REFRESH = st.sidebar.button("🔄 Refresh data now")
+if REFRESH:
+    st.cache_data.clear()
 
 
 # ============================================================
-# CORE LOGIC (same math as the CLI version)
+# DATA FETCHING
 # ============================================================
 
-@st.cache_data(ttl=900, show_spinner=False)  # cache 15 min so repeat opens are fast
-def fetch_history(ticker: str, period: str) -> pd.DataFrame:
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_sp500_tickers() -> list:
+    """Pull the current S&P 500 constituent list from Wikipedia."""
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    tables = pd.read_html(url)
+    df = tables[0]
+    tickers = df["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
+    return sorted(tickers)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_history_single(ticker: str, period: str = "10y") -> pd.DataFrame:
     df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
     if df.empty:
         raise ValueError(f"No data returned for {ticker}")
     return df
 
 
-def compute_cagr(prices: pd.Series) -> float:
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_history_batch(tickers: tuple, period: str = "10y") -> dict:
+    """
+    Download many tickers in batches (yf.download handles multiple
+    tickers in one HTTP round-trip, far faster than one call per
+    ticker). Returns {ticker: DataFrame with Close/Volume}.
+    """
+    results = {}
+    tickers = list(tickers)
+    for i in range(0, len(tickers), BATCH_SIZE):
+        chunk = tickers[i:i + BATCH_SIZE]
+        try:
+            data = yf.download(
+                chunk, period=period, auto_adjust=True,
+                group_by="ticker", threads=True, progress=False,
+            )
+        except Exception:
+            continue
+        for t in chunk:
+            try:
+                if len(chunk) == 1:
+                    sub = data
+                else:
+                    sub = data[t]
+                sub = sub.dropna(how="all")
+                if not sub.empty and "Close" in sub and sub["Close"].notna().sum() > 50:
+                    results[t] = sub
+            except Exception:
+                continue
+    return results
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def compute_cagr(prices: pd.Series, years: float = None) -> float:
+    prices = prices.dropna()
+    if len(prices) < 2:
+        return np.nan
+    if years is not None:
+        cutoff = prices.index[-1] - pd.Timedelta(days=int(years * 365.25))
+        prices = prices[prices.index >= cutoff]
+        if len(prices) < 2:
+            return np.nan
     n_years = (prices.index[-1] - prices.index[0]).days / 365.25
     if n_years <= 0:
         return np.nan
     return (prices.iloc[-1] / prices.iloc[0]) ** (1 / n_years) - 1
 
 
-def compute_correlation(stock_prices, benchmark_prices, freq=RETURN_FREQ) -> float:
-    stock_ret = stock_prices.resample(freq).last().pct_change().dropna()
-    bench_ret = benchmark_prices.resample(freq).last().pct_change().dropna()
+def compute_correlation(stock_prices, benchmark_prices, freq=RETURN_FREQ, years=2) -> float:
+    cutoff = stock_prices.index[-1] - pd.Timedelta(days=int(years * 365.25))
+    s = stock_prices[stock_prices.index >= cutoff]
+    b = benchmark_prices[benchmark_prices.index >= cutoff]
+    stock_ret = s.resample(freq).last().pct_change().dropna()
+    bench_ret = b.resample(freq).last().pct_change().dropna()
     aligned = pd.concat([stock_ret, bench_ret], axis=1, join="inner").dropna()
     if len(aligned) < 10:
         return np.nan
     return aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
 
 
-def compute_sharpe(prices: pd.Series, risk_free_rate: float) -> float:
-    daily_ret = prices.pct_change().dropna()
+def compute_sharpe(prices: pd.Series, risk_free_rate: float, years=2) -> float:
+    cutoff = prices.index[-1] - pd.Timedelta(days=int(years * 365.25))
+    p = prices[prices.index >= cutoff]
+    daily_ret = p.pct_change().dropna()
     if daily_ret.std() == 0 or daily_ret.empty:
         return np.nan
     excess_daily_rf = risk_free_rate / 252
     return (daily_ret.mean() - excess_daily_rf) / daily_ret.std() * np.sqrt(252)
-
-
-def compute_annualized_vol(prices: pd.Series) -> float:
-    return prices.pct_change().dropna().std() * np.sqrt(252)
 
 
 def compute_rsi(prices: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
@@ -130,43 +222,110 @@ def compute_rvol(volume: pd.Series, window: int = 20) -> pd.Series:
     return volume / volume.rolling(window).mean()
 
 
-def screen_ticker(ticker: str, gold_prices: pd.Series, vix_level: float) -> dict:
-    hist = fetch_history(ticker, LOOKBACK_PERIOD)
-    close, volume = hist["Close"], hist["Volume"]
+def compute_volume_percentile(volume: pd.Series, window: int = VOL_PCT_WINDOW) -> pd.Series:
+    """Today's volume rank (0-1) within the trailing `window` days —
+    answers 'is volume higher than usual over the past year', not
+    just vs the last 20 days like RVOL does."""
+    return volume.rolling(window).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1],
+                                         raw=False)
 
-    cagr = compute_cagr(close)
-    gold_cagr = compute_cagr(gold_prices)
+
+# ============================================================
+# FUNDAMENTAL SCREEN (runs on full universe — cheap)
+# ============================================================
+
+def fundamental_screen_row(ticker: str, hist: pd.DataFrame, gold_prices: pd.Series) -> dict:
+    close = hist["Close"].dropna()
+    cagr_5y = compute_cagr(close, years=5)
+    cagr_10y = compute_cagr(close, years=10)
+    gold_cagr_5y = compute_cagr(gold_prices, years=5)
+    gold_cagr_10y = compute_cagr(gold_prices, years=10)
+
     corr = compute_correlation(close, gold_prices)
     sharpe = compute_sharpe(close, RISK_FREE_RATE)
-    vol_annual = compute_annualized_vol(close)
 
+    filter_cagr = cagr_5y if CAGR_WINDOW_FOR_FILTER == "5y" else cagr_10y
+    filter_gold_cagr = gold_cagr_5y if CAGR_WINDOW_FOR_FILTER == "5y" else gold_cagr_10y
+
+    beats_gold = (not np.isnan(filter_cagr)) and (filter_cagr > filter_gold_cagr)
+    corr_ok = (not np.isnan(corr)) and (corr < CORRELATION_MAX)
+    sharpe_ok = (not np.isnan(sharpe)) and (sharpe > SHARPE_MIN)
+    eligible = beats_gold and corr_ok and sharpe_ok
+
+    return {
+        "Ticker": ticker,
+        "Eligible": eligible,
+        "CAGR 5y": cagr_5y, "CAGR 10y": cagr_10y,
+        "Gold CAGR 5y": gold_cagr_5y, "Gold CAGR 10y": gold_cagr_10y,
+        "Beats Gold": beats_gold,
+        "Corr vs Gold": corr, "Corr OK": corr_ok,
+        "Sharpe": sharpe, "Sharpe OK": sharpe_ok,
+    }
+
+
+# ============================================================
+# TECHNICAL READOUT (runs only on eligible tickers — small set)
+# ============================================================
+
+def technical_row(ticker: str, hist: pd.DataFrame, vix_level: float) -> dict:
+    close, volume = hist["Close"].dropna(), hist["Volume"].dropna()
     rsi = compute_rsi(close).iloc[-1]
     cdc = compute_cdc_action_zone(close)
     current_zone = cdc["zone"].iloc[-1]
     buy_trigger_today = bool(cdc["buy_trigger"].iloc[-1])
     rvol = compute_rvol(volume).iloc[-1]
+    vol_pct = compute_volume_percentile(volume).iloc[-1]
 
-    passes_cagr = (cagr > gold_cagr) if CAGR_MUST_BEAT_GOLD else True
-    passes_corr = (not np.isnan(corr)) and (corr < CORRELATION_MAX)
-    passes_sharpe = (not np.isnan(sharpe)) and (sharpe > SHARPE_MIN)
-    fundamentally_eligible = passes_cagr and passes_corr and passes_sharpe
-
-    in_trend_volume = rvol > RVOL_THRESHOLD
     rsi_buy_zone = rsi < RSI_BUY_THRESHOLD
+    in_trend_rvol = rvol > RVOL_THRESHOLD
+    in_trend_pct = (not np.isnan(vol_pct)) and (vol_pct > VOL_PCT_THRESHOLD)
+    in_trend_volume = in_trend_rvol and in_trend_pct
 
-    alert = fundamentally_eligible and buy_trigger_today and rsi_buy_zone and in_trend_volume
+    alert = buy_trigger_today and rsi_buy_zone and in_trend_volume
 
     return {
-        "Ticker": ticker, "ALERT": "🔔 BUY" if alert else "",
-        "Eligible": "✅" if fundamentally_eligible else "❌",
-        "CAGR": cagr, "Gold CAGR": gold_cagr, "Beats Gold": passes_cagr,
-        "Corr vs Gold": corr, "Corr OK": passes_corr,
-        "Sharpe": sharpe, "Sharpe OK": passes_sharpe,
-        "Ann. Vol": vol_annual,
+        "Ticker": ticker,
+        "ALERT": "🔔 BUY" if alert else "",
         "RSI": rsi, "RSI Buy Zone": rsi_buy_zone,
         "CDC Zone": current_zone, "CDC Buy Today": buy_trigger_today,
-        "RVOL": rvol, "In Trend": in_trend_volume,
+        "RVOL": rvol, "Vol Percentile (1y)": vol_pct, "In Trend": in_trend_volume,
     }
+
+
+# ============================================================
+# BACKTEST
+# ============================================================
+
+def run_backtest(hist: pd.DataFrame, horizons=(5, 20, 60)) -> pd.DataFrame:
+    """Replay the ALERT logic historically on one ticker and measure
+    forward returns after each past signal."""
+    close, volume = hist["Close"].dropna(), hist["Volume"].dropna()
+    rsi = compute_rsi(close)
+    cdc = compute_cdc_action_zone(close)
+    rvol = compute_rvol(volume)
+    vol_pct = compute_volume_percentile(volume)
+
+    signal = (
+        cdc["buy_trigger"]
+        & (rsi < RSI_BUY_THRESHOLD)
+        & (rvol > RVOL_THRESHOLD)
+        & (vol_pct > VOL_PCT_THRESHOLD)
+    )
+    signal_dates = close.index[signal.reindex(close.index, fill_value=False)]
+
+    rows = []
+    for d in signal_dates:
+        pos = close.index.get_loc(d)
+        row = {"Signal Date": d.date(), "Price at Signal": close.iloc[pos]}
+        for h in horizons:
+            if pos + h < len(close):
+                fwd_ret = close.iloc[pos + h] / close.iloc[pos] - 1
+                row[f"+{h}d Return"] = fwd_ret
+            else:
+                row[f"+{h}d Return"] = np.nan
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 # ============================================================
@@ -175,69 +334,165 @@ def screen_ticker(ticker: str, gold_prices: pd.Series, vix_level: float) -> dict
 
 st.title("🪙 Gold-Beating Stock Screener")
 st.caption(
-    "Screens stocks against your thesis: must beat gold's CAGR, "
-    "stay low-correlation with gold, clear a Sharpe bar, and only "
-    "alert when RSI + CDC ActionZone + volume all line up."
+    "Stage 1 screens the whole universe on fundamentals only (must beat "
+    "gold's CAGR, stay low-correlation, clear a Sharpe bar). Stage 2 shows "
+    "full technical detail for the stocks that pass, so you make the final "
+    "call — with an automatic ALERT flagged when RSI + CDC ActionZone + "
+    "volume all line up too."
 )
 
-if REFRESH:
-    st.cache_data.clear()
+tab_screen, tab_backtest = st.tabs(["📊 Screener", "🔁 Backtest"])
 
-with st.spinner("Fetching gold benchmark and VIX..."):
-    try:
-        gold_prices = fetch_history(GOLD_PROXY, LOOKBACK_PERIOD)["Close"]
-        vix_level = fetch_history(VIX_TICKER, "5d")["Close"].iloc[-1]
-    except Exception as e:
-        st.error(f"Failed to fetch benchmark data: {e}")
+with tab_screen:
+    with st.spinner("Fetching gold benchmark and VIX..."):
+        try:
+            gold_prices = fetch_history_single(GOLD_PROXY, "10y")["Close"]
+            vix_level = fetch_history_single(VIX_TICKER, "5d")["Close"].iloc[-1]
+        except Exception as e:
+            st.error(f"Failed to fetch benchmark data: {e}")
+            st.stop()
+
+    if universe_mode == "Full S&P 500 (capped)":
+        with st.spinner("Fetching S&P 500 constituent list..."):
+            try:
+                all_sp500 = fetch_sp500_tickers()
+            except Exception as e:
+                st.error(f"Failed to fetch S&P 500 list: {e}")
+                st.stop()
+        RAW_TICKERS = all_sp500[:MAX_TICKERS]
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric(f"Gold CAGR ({CAGR_WINDOW_FOR_FILTER})",
+                f"{compute_cagr(gold_prices, years=5 if CAGR_WINDOW_FOR_FILTER=='5y' else 10)*100:.1f}%")
+    col2.metric("Current VIX", f"{vix_level:.1f}",
+                "FEAR ZONE" if vix_level > VIX_FEAR_THRESHOLD else "normal")
+    col3.metric("Universe size", f"{len(RAW_TICKERS)} tickers")
+
+    st.divider()
+    st.subheader("Stage 1 — Fundamental screen (full universe)")
+
+    with st.spinner(f"Downloading price history for {len(RAW_TICKERS)} tickers "
+                     f"(batched, cached 15 min)..."):
+        hist_map = fetch_history_batch(tuple(RAW_TICKERS), "10y")
+
+    missing = set(RAW_TICKERS) - set(hist_map.keys())
+    if missing:
+        st.caption(f"Skipped {len(missing)} ticker(s) with insufficient data: "
+                   + ", ".join(list(missing)[:20]) + ("..." if len(missing) > 20 else ""))
+
+    fund_rows = []
+    progress = st.progress(0.0, text="Screening fundamentals...")
+    tickers_with_data = list(hist_map.keys())
+    for i, t in enumerate(tickers_with_data):
+        try:
+            fund_rows.append(fundamental_screen_row(t, hist_map[t], gold_prices))
+        except Exception:
+            pass
+        progress.progress((i + 1) / max(len(tickers_with_data), 1))
+    progress.empty()
+
+    if not fund_rows:
+        st.info("No results.")
         st.stop()
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Gold CAGR (lookback)", f"{compute_cagr(gold_prices)*100:.1f}%")
-col2.metric("Current VIX", f"{vix_level:.1f}",
-            "FEAR ZONE" if vix_level > VIX_FEAR_THRESHOLD else "normal")
-col3.metric("Last updated", datetime.now().strftime("%Y-%m-%d %H:%M"))
+    fund_df = pd.DataFrame(fund_rows).sort_values("Eligible", ascending=False)
+    eligible_tickers = fund_df[fund_df["Eligible"]]["Ticker"].tolist()
 
-st.divider()
+    st.write(f"**{len(eligible_tickers)} of {len(fund_df)}** tickers passed the "
+             f"fundamental filter (beats gold {CAGR_WINDOW_FOR_FILTER} CAGR, "
+             f"correlation < {CORRELATION_MAX}, Sharpe > {SHARPE_MIN}).")
 
-rows = []
-errors = []
-progress = st.progress(0.0, text="Screening tickers...")
-for i, t in enumerate(TICKERS):
-    try:
-        rows.append(screen_ticker(t, gold_prices, vix_level))
-    except Exception as e:
-        errors.append(f"{t}: {e}")
-    progress.progress((i + 1) / len(TICKERS), text=f"Screening {t}...")
-progress.empty()
+    st.dataframe(
+        fund_df.style.format({
+            "CAGR 5y": "{:.1%}", "CAGR 10y": "{:.1%}",
+            "Gold CAGR 5y": "{:.1%}", "Gold CAGR 10y": "{:.1%}",
+            "Corr vs Gold": "{:.2f}", "Sharpe": "{:.2f}",
+        }),
+        use_container_width=True, hide_index=True,
+    )
 
-if errors:
-    st.warning("Some tickers failed:\n" + "\n".join(errors))
+    st.divider()
+    st.subheader("Stage 2 — Technical detail (eligible tickers only)")
 
-if not rows:
-    st.info("No results to show.")
-    st.stop()
+    if not eligible_tickers:
+        st.info("No tickers passed the fundamental filter — nothing to show "
+                 "technicals for. Try loosening the thresholds in the sidebar.")
+    else:
+        tech_rows = [technical_row(t, hist_map[t], vix_level) for t in eligible_tickers]
+        tech_df = pd.DataFrame(tech_rows).sort_values("ALERT", ascending=False)
 
-df = pd.DataFrame(rows).sort_values("ALERT", ascending=False)
+        alerts = tech_df[tech_df["ALERT"] != ""]
+        if not alerts.empty:
+            st.success(f"🔔 {len(alerts)} buy alert(s) today: "
+                       + ", ".join(alerts["Ticker"].tolist()))
+        else:
+            st.info("No combined buy alerts right now — RSI, CDC zone and "
+                    "volume all need to align at once, on top of already "
+                    "passing fundamentals.")
 
-alerts = df[df["ALERT"] != ""]
-if not alerts.empty:
-    st.success(f"🔔 {len(alerts)} buy alert(s) today: "
-               + ", ".join(alerts["Ticker"].tolist()))
-else:
-    st.info("No combined buy alerts right now — fundamentals, RSI, CDC zone "
-            "and volume all need to align at once.")
+        st.dataframe(
+            tech_df.style.format({
+                "RSI": "{:.1f}", "RVOL": "{:.2f}", "Vol Percentile (1y)": "{:.0%}",
+            }),
+            use_container_width=True, hide_index=True,
+        )
 
-st.dataframe(
-    df.style.format({
-        "CAGR": "{:.1%}", "Gold CAGR": "{:.1%}", "Corr vs Gold": "{:.2f}",
-        "Sharpe": "{:.2f}", "Ann. Vol": "{:.1%}", "RSI": "{:.1f}", "RVOL": "{:.2f}",
-    }),
-    use_container_width=True,
-    hide_index=True,
-)
+    st.caption(
+        "Data via Yahoo Finance (typically 15-20 min delayed). CDC ActionZone is "
+        "a best-effort reimplementation — verify against TradingView. This is a "
+        "decision-support tool, not investment advice."
+    )
 
-st.caption(
-    "Data via Yahoo Finance (typically 15-20 min delayed). CDC ActionZone is "
-    "a best-effort reimplementation — verify against TradingView. This is a "
-    "decision-support tool, not investment advice."
-)
+with tab_backtest:
+    st.subheader("Backtest the ALERT logic on one ticker")
+    bt_ticker = st.text_input("Ticker to backtest", value="NVDA").strip().upper()
+    bt_period = st.selectbox("History length", ["5y", "10y", "max"], index=1)
+    run_bt = st.button("Run backtest")
+
+    if run_bt and bt_ticker:
+        with st.spinner(f"Fetching history and running backtest for {bt_ticker}..."):
+            try:
+                bt_hist = fetch_history_single(bt_ticker, bt_period)
+                bt_results = run_backtest(bt_hist)
+            except Exception as e:
+                st.error(f"Backtest failed: {e}")
+                bt_results = None
+
+        if bt_results is not None:
+            if bt_results.empty:
+                st.info("No historical signals fired for this ticker with the "
+                        "current thresholds — try loosening RSI / RVOL / volume "
+                        "percentile in the sidebar.")
+            else:
+                st.write(f"**{len(bt_results)} historical signal(s)** found.")
+                st.dataframe(
+                    bt_results.style.format({
+                        "Price at Signal": "{:.2f}",
+                        "+5d Return": "{:.1%}", "+20d Return": "{:.1%}", "+60d Return": "{:.1%}",
+                    }),
+                    use_container_width=True, hide_index=True,
+                )
+
+                st.markdown("**Summary**")
+                summary_cols = st.columns(3)
+                for i, h in enumerate((5, 20, 60)):
+                    col_name = f"+{h}d Return"
+                    valid = bt_results[col_name].dropna()
+                    if len(valid) > 0:
+                        win_rate = (valid > 0).mean()
+                        avg_ret = valid.mean()
+                        summary_cols[i].metric(
+                            f"{h}-day forward",
+                            f"{avg_ret:.1%} avg",
+                            f"{win_rate:.0%} win rate ({len(valid)} signals)",
+                        )
+                    else:
+                        summary_cols[i].metric(f"{h}-day forward", "n/a")
+
+        st.caption(
+            "Backtest replays today's exact ALERT rule (CDC just turned green + "
+            "RSI below threshold + RVOL and 1y volume percentile both above "
+            "threshold) at every point in history. Past signals do not "
+            "guarantee future ones will behave the same way — this is a "
+            "sanity check on the rule, not a promise of future returns."
+        )
